@@ -1,0 +1,361 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+There are 3-4 packages you will need to install for today's practical: `install.packages(c("xgboost", "eegkit", "forecast", "tseries", "caret"))` apart from that everything else should already be available on your system. 
+
+If you are using a newer Mac you may have to also install [quartz](https://www.xquartz.org/) to have everything work (do this if you see errors about `X11` during install/execution).
+
+I will endeavour to use explicit imports to make it clear where functions are coming from (functions without `library_name::` are part of base R or a function we've defined in this notebook).
+
+```{r libraries, echo=FALSE}
+# Using the same library we used earlier in the course for tabular data because we know it works!
+library(xgboost)
+
+# EEG manipulation library in R (although very limited compared to signal processing libraries available in other languages, matlab might actually still be a leader in this specific area)
+library(eegkit)
+
+# some time series functions (that we only skim the depths of)
+library(forecast)
+library(tseries)
+library(caret)
+
+# just tidyverse libraries that should already be installed
+library(dplyr)
+library(reshape2)
+library(purrr)
+library(ggplot2)
+```
+
+## EEG Eye Detection Data
+
+One of the most common types of medical sensor data (and one that we talked about during the lecture) are Electroencephalograms (EEGs).  
+These measure mesoscale electrical signals (measured in microvolts) within the brain, which are indicative of a region of neuronal activity.
+Typically, EEGs involve an array of sensors (aka channels) placed on the scalp with a high degree of covariance between sensors.
+
+As EEG data can be very large and unwieldy, we are going to use a relatively small/simple dataset today from [this paper](http://ehrai.com/su/pdf/aihls2013.pdf).
+
+This dataset is a 117 second continuous EEG measurement collected from a single person with a device called a "Emotiv EEG Neuroheadset".
+In combination with the EEG data collection, a camera was used to record whether person being recorded had their eyes open or closed. 
+This was eye status was then manually annotated onto the EEG data with `1` indicated the eyes being closed and `0` the eyes being open.
+Measures microvoltages are listed in chronological order with the first measured value at the top of the dataframe.
+
+Let's parse the data directly from the `h2o` library's (which we aren't actually using directly) test data S3 bucket:
+
+```{r parse_data}
+eeg_url <- "https://h2o-public-test-data.s3.amazonaws.com/smalldata/eeg/eeg_eyestate_splits.csv"
+eeg_data <- read.csv(eeg_url)
+
+# add timestamp
+Fs <- 117 / nrow(eeg_data)
+eeg_data <- transform(eeg_data, ds = seq(0, 116.99999, by = Fs), eyeDetection = as.factor(eyeDetection))
+print(table(eeg_data$eyeDetection))
+
+# split dataset into train, validate, test
+eeg_train <- subset(eeg_data, split == 'train', select = -split)
+print(table(eeg_train$eyeDetection))
+
+eeg_validate <- subset(eeg_data, split == 'valid', select = -split)
+eeg_test <- subset(eeg_data, split == 'test', select = -split)
+```
+
+**0** Knowing the `eeg_data` contains 117 seconds of data, inspect the `eeg_data` dataframe and the code above to and determine how many samples per second were taken?
+
+There are 14,980 observations. 14,980/117= 128. So 128 samples were taken per second.
+
+**1** How many EEG electrodes/sensors were used?
+
+After checking the data frame, there are 14 sensors (columns). "AF3, F7, F3, FC5, T7, P7, O1, O2, P8, T8, FC6, F4, F8, AF4".
+
+### Exploratory Data Analysis
+
+Now that we have the dataset and some basic parameters let's begin with the ever important/relevant exploratory data analysis.
+
+First we should check there is no missing data!
+```{r check_na}
+sum(is.na(eeg_data))
+```
+
+Great, now we can start generating some plots to look at this data within the time-domain.
+
+First we use `reshape2::melt()` to transform the `eeg_data` dataset from a wide format to a long format expected by `ggplot2`.
+
+Specifically, this converts from "wide" where each electrode has its own column, to a "long" format, where each observation has its own row. 
+This format is often more convenient for data analysis and visualization, especially when dealing with repeated measurements or time-series data.
+
+We then use `ggplot2` to create a line plot of electrode intensities per sampling time, with the lines coloured by electrode, and the eye status annotated using dark grey blocks.
+
+```{r plot_data}
+melt <- reshape2::melt(eeg_data %>% dplyr::select(-split), id.vars=c("eyeDetection", "ds"), variable.name = "Electrode", value.name = "microvolts")
+
+
+ggplot2::ggplot(melt, ggplot2::aes(x=ds, y=microvolts, color=Electrode)) + 
+  ggplot2::geom_line() + 
+  ggplot2::ylim(3500,5000) + 
+  ggplot2::geom_vline(ggplot2::aes(xintercept=ds), data=dplyr::filter(melt, eyeDetection==1), alpha=0.005)
+```
+
+**2** Do you see any obvious patterns between eyes being open (dark grey blocks in the plot) and the EEG intensities?
+
+When the eyes are open, the amplitude of the EEG signals seems to increase. Additionally, there are noticablily more wave crests and troughs. Furthermore, all the channels seem to show these patterns. This suggests that brain activity becomes stronger when the eyes are open.
+  
+**3** Similarly, based on the distribution of eye open/close state over time to anticipate any temporal correlation between these states?
+
+To predict the temporal correlation between eye open and closed states, we may need further temporal analysis. There are several approaches:
+
+First, the intervals of eye open/close states seem to have a pattern. We can apply Time Series Analysis and use the autocorrelation function (ACF) to determine if these eye open and closed states repeat at regular intervals.
+
+Second, the duration of each eye state appears to be relatively consistent. We can identify the typical duration and variation of these states by calculating the mean and variance.
+
+Third, there are significant signal changes when the eye status changes. We can check these change points for patterns.
+
+Lastly, we can use machine learning models to detect patterns and make predictions. 
+
+Let's see if we can directly look at the distribution of EEG intensities and see how they related to eye status.
+
+
+As there are a few extreme outliers in voltage we will use the `dplyr::filter` function to remove values outwith of 3750 to 50003. The function uses the `%in%` operator to check if each value of microvolts is within that range. The function also uses the `dplyr::mutate()` to change the type of the variable eyeDetection from numeric to a factor (R's categorical variable type).
+
+```{r compare_distrib}
+melt_train <- reshape2::melt(eeg_train, id.vars=c("eyeDetection", "ds"), variable.name = "Electrode", value.name = "microvolts")
+
+# filter huge outliers in voltage
+filt_melt_train <- dplyr::filter(melt_train, microvolts %in% (3750:5000)) %>% dplyr::mutate(eyeDetection=as.factor(eyeDetection))
+
+ggplot2::ggplot(filt_melt_train, ggplot2::aes(y=Electrode, x=microvolts, fill=eyeDetection)) + ggplot2::geom_boxplot()
+```
+
+
+
+Plots are great but sometimes so it is also useful to directly look at the summary statistics and how they related to eye status.
+We will do this by grouping the data based on eye status and electrode before calculating the statistics using the convenient `dplyr::summarise` function.
+
+```{r compare_summary_stats}
+filt_melt_train %>% dplyr::group_by(eyeDetection, Electrode) %>% 
+    dplyr::summarise(mean = mean(microvolts), median=median(microvolts), sd=sd(microvolts)) %>% 
+    dplyr::arrange(Electrode)
+```
+
+
+
+
+**4** Based on these analyses are any electrodes consistently more intense or varied when eyes are open?
+
+Based on the boxplot and summary table analyses, we will look at the median for intensity and variance for variety. Most of the electrodes have similar median values regardless of eye status, except for electrodes F8 and T8, which show significantly higher medians when the eyes are open. Additionally, electrodes FC6 and F8 display more variability when the eyes are open.
+
+#### Time-Related Trends
+
+As it looks like there may be a temporal pattern in the data we should investigate how it changes over time.  
+
+First we will do a statistical test for stationarity:
+
+```{r convert_to_tseries}
+apply(eeg_train, 2, tseries::adf.test)
+```
+
+
+**5** What is stationarity?
+
+According to the National Institute of Standards and Technology, a stationary process is one where the mean, variance, and autocorrelation structure remain constant over time. This means that a stationary time series has statistical properties that are independent of the time at which they are observed. Therefore, time series with trends or seasonality are not stationary, as these elements cause the values of the time series to vary over time.
+
+**6** Why are we interested in stationarity? What do the results of these tests tell us? (ignoring the lack of multiple comparison correction...)
+
+Stationarity is important because many models and statistical methods for time series analysis assume that the data is stationary. If the data is non-stationary, these models and methods may not perform well. Overall, stationarity makes the data less complex and easier to analyze.
+
+In the results, only the variable "ds" has a high p-value, indicating that it is non-stationary. All the other variables are stationary.
+
+Then we may want to visually explore patterns of autocorrelation (previous values predict future ones) and cross-correlation (correlation across channels over time) using `forecast::ggAcf` function.
+
+The ACF plot displays the cross- and auto-correlation values for different lags (i.e., time delayed versions of each electrode's voltage timeseries) in the dataset. 
+It helps identify any significant correlations between channels and observations at different time points. 
+Positive autocorrelation indicates that the increase in voltage observed in a given time-interval leads to a proportionate increase in the lagged time interval as well.
+Negative autocorrelation indicates the opposite!
+
+
+```{r correlation}
+forecast::ggAcf(eeg_train %>% dplyr::select(-ds))
+```
+
+
+
+
+
+**7** Do any fields show signs of strong autocorrelation (diagonal plots)? Do any pairs of fields show signs of cross-correlation? Provide examples.
+
+There are many fields that show strong autocorrelation, with the most significant being "eyeDetection." Other fields with strong autocorrelation include F7, FC5, T7, O1, O2, T8, FC6, and F4.
+
+Pairs showing notable cross-correlation include F7 and FC5, FC5 and T7, and FC5 and F3.
+
+#### Frequency-Space 
+
+We can also explore the data in frequency space by using a Fast Fourier Transform.  
+After the FFT we can summarise the distributions of frequencies by their density across the power spectrum.
+This will let us see if there any obvious patterns related to eye status in the overall frequency distributions.
+
+```{r fft_open}
+eegkit::eegpsd(eeg_train %>% dplyr::filter(eyeDetection == 0) %>% dplyr::select(-eyeDetection, -ds), Fs = Fs, xlab="Eye Open")
+```
+
+```{r fft_closed}
+eegkit::eegpsd(eeg_train %>% dplyr::filter(eyeDetection == 1) %>% dplyr::select(-eyeDetection, -ds), Fs = Fs, xlab="Eye Closed")
+```
+
+
+
+
+**8** Do you see any differences between the power spectral densities for the two eye states? If so, describe them.
+
+Generally, in the eye open state, the plots show higher power levels, as indicated by the predominantly green and blue colors across most channels. In contrast, the eye closed state displays lower power levels, with more areas in blue and darker blue shades.
+
+Channels 1, 9, and 13 show high power with orange colors when the eyes are closed. Conversely, channels 6 and 14 show high power levels when the eyes are open and lower power levels when the eyes are closed. This suggests that different brain activities occur during different eye states.
+
+
+#### Independent Component Analysis
+
+We may also wish to explore whether there are multiple sources of neuronal activity being picked up by the sensors.  
+This can be achieved using a process known as independent component analysis (ICA) which decorrelates the channels and identifies the primary sources of signal within the decorrelated matrix.
+
+```{r ica, warning=FALSE}
+ica <- eegkit::eegica(eeg_train %>% dplyr::select(-eyeDetection, -ds), nc=3, method='fast', type='time')
+mix <- dplyr::as_tibble(ica$M)
+mix$eyeDetection <- eeg_train$eyeDetection
+mix$ds <- eeg_train$ds
+
+mix_melt <- reshape2::melt(mix, id.vars=c("eyeDetection", "ds"), variable.name = "Independent Component", value.name = "M")
+
+
+ggplot2::ggplot(mix_melt, ggplot2::aes(x=ds, y=M, color=`Independent Component`)) + 
+  ggplot2::geom_line() + 
+  ggplot2::geom_vline(ggplot2::aes(xintercept=ds), data=dplyr::filter(mix_melt, eyeDetection==1), alpha=0.005) +
+  ggplot2::scale_y_log10()
+```
+
+
+
+**9** Does this suggest eye opening relates to an independent component of activity across the electrodes?
+
+The component V1 shows significant fluctuations, especially during the eye open periods. During these times, there are notable peaks and troughs in V1's wave. For most of the time period, the magnitude (M) stays above 1, but when the eyes are open, there are significant troughs, sometimes even dropping below 1. The significant peaks and troughs in V1's magnitude may indicate brain activity associated with eye opening.
+
+### Eye Opening Prediction
+
+Now that we've explored the data let's use a simple model to see how well we can predict eye status from the EEGs:
+
+```{r xgboost}
+# Convert the training and validation datasets to matrices
+eeg_train_matrix <- as.matrix(dplyr::select(eeg_train, -eyeDetection, -ds))
+eeg_train_labels <- as.numeric(eeg_train$eyeDetection) -1
+
+eeg_validate_matrix <- as.matrix(dplyr::select(eeg_validate, -eyeDetection, -ds))
+eeg_validate_labels <- as.numeric(eeg_validate$eyeDetection) -1
+
+# Build the xgboost model
+model <- xgboost(data = eeg_train_matrix, 
+                 label = eeg_train_labels,
+                 nrounds = 100,
+                 max_depth = 4,
+                 eta = 0.1,
+                 objective = "binary:logistic")
+
+print(model)
+```
+
+
+
+**10** Using the `caret` library (or any other library/model type you want such as a naive Bayes) fit another model to predict eye opening.
+
+```{r model2}
+# Load necessary library
+library(e1071)
+
+# Convert the training and validation datasets to matrices
+eeg_train_matrix <- as.matrix(dplyr::select(eeg_train, -eyeDetection, -ds))
+eeg_train_labels <- as.factor(eeg_train$eyeDetection)
+
+eeg_validate_matrix <- as.matrix(dplyr::select(eeg_validate, -eyeDetection, -ds))
+eeg_validate_labels <- as.factor(eeg_validate$eyeDetection)
+
+# Build the Naive Bayes model
+nb_model <- naiveBayes(eeg_train_matrix, eeg_train_labels)
+
+print(nb_model)
+
+```
+
+**11** Using the best performing of the two models (on the validation dataset) calculate and report the test performance (filling in the code below):
+
+```{r test XGboost}
+# Performance of XGboost
+
+library(pROC)
+
+predictions <- predict(model, eeg_validate_matrix)
+
+predicted_labels <- ifelse(predictions > 0.5, 1, 0)
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(eeg_validate_labels))
+print(conf_matrix)
+
+# AUC-ROC
+roc_curve <- roc(eeg_validate_labels, predictions)
+auc <- auc(roc_curve)
+print(paste("XGboost AUC:", auc))
+```
+
+```{r test Naive Bayes}
+# Performance of Naive Bayes
+
+library(pROC)
+
+nb_predictions <- predict(nb_model, eeg_validate_matrix, type = "raw")[, 2]
+nb_predicted_labels <- ifelse(nb_predictions > 0.5, 1, 0)
+
+# Confusion matrix for Naive Bayes
+nb_conf_matrix <- confusionMatrix(as.factor(nb_predicted_labels), as.factor(eeg_validate_labels))
+print(nb_conf_matrix)
+
+# AUC-ROC for Naive Bayes
+nb_roc_curve <- roc(eeg_validate_labels, nb_predictions)
+nb_auc <- auc(nb_roc_curve)
+print(paste("Naive Bayes AUC:", nb_auc))
+```
+
+By comparison, the XGBoost model clearly delivers better results. It has much higher accuracy, Kappa, and AUC scores. Additionally, sensitivity and specificity are more balanced in the XGBoost model.
+
+**12** Describe 2 possible alternative modeling approaches for prediction of eye opening from EEGs we discussed in the lecture but haven't explored in this notebook.
+
+Two alternative modeling approaches we can use: 
+
+1) Using Convolutional Neural Networks (CNNs) by converting EEG data into the frequency domain and treating the frequency distribution as images for convolution; 
+
+2) Using Recurrent Neural Networks (RNNs) such as Long Short-Term Memory (LSTM) networks to capture temporal dependencies in the EEG signals.
+
+
+**13** What are 2 R libraries you could use to implement these approaches? (note: you don't actually have to implement them though!)
+
+We can use the packages "keras" (which interfaces with TensorFlow) and "torch" to implement these neural network models.
+
+## Optional
+
+**14** (Optional) As this is the last practical of the course - let me know how you would change future offerings of this course. This will not impact your marks!
+
+- What worked and didn’t work for you (e.g., in terms of the practicals, tutorials, and lectures)?
+
+I think the practicals and tutorials worked well. They reflected the lectures and really guided me through mastering new techniques.
+
+However, the lectures were somewhat challenging for me. I have to admit that I couldn't follow along at times.
+
+- Was learning how to run the practicals on your own machines instead of a clean server that will disappear after the course worth the technical challenges?
+
+I believe running the practicals on my own computer is a better approach. Since we will be working on local computers in our professional environments, it is good practice to get familiar with processes on our own machines
+ 
+- What would you add or remove from the course? 
+
+- What was the main thing you will take away from this course?
+
+I came to know various types of health data, such as Electronic Medical Records (EMR), medical imaging data, and how to effectively manage and analyze them.
+
+
+
+
+
+
